@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
 use std::pin::pin;
 use std::slice;
+use std::sync::Arc;
 
 use futures::Stream;
 use futures::StreamExt as _;
@@ -43,6 +44,7 @@ use crate::op_walk;
 use crate::operation::Operation;
 use crate::repo::ReadonlyRepo;
 use crate::repo::Repo as _;
+use crate::store::Store;
 
 /// Commit with predecessor information.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -76,6 +78,15 @@ impl CommitEvolutionEntry {
                 .map(|id| store.get_commit_async(id)),
         )
         .await
+    }
+
+    /// Creates an entry for the root commit.
+    pub fn for_root_commit(store: &Arc<Store>) -> Self {
+        Self {
+            commit: store.root_commit(),
+            operation: None,
+            reachable_predecessors: Some(vec![]),
+        }
     }
 }
 
