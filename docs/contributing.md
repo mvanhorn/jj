@@ -124,6 +124,16 @@ which there is no final removal date yet.
 
 ## Contributing large patches
 
+As a new or in-experienced contributor you first should gather some experience
+by working on smaller problems before even approaching these.
+
+It also is a better experience for the community if you've first talked
+about your ideas in a related discussion, either on a relevant issue, the
+Discord or a GitHub discussion and have consensus that the design is something
+the project wants to pursue before spending time on an implementation or the
+design doc. The design docs themselves _are_ not places to discuss ideas, as
+the actual buy-in should've happened before you sat down to write it.
+
 Before sending a PR for a large change which designs/redesigns or reworks an
 existing component, we require an architecture review from  multiple
 stakeholders, which we do with [Design Docs](design_docs.md), see the

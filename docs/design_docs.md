@@ -1,6 +1,6 @@
 # Jujutsu Design Docs
 
-Jujutsu uses Design Docs to drive technical decisions on large projects and it
+Jujutsu uses [Design Docs] to drive technical decisions on large projects and it
 is the place to discuss your proposed design or new component. It is a very
 thorough process, in which the design doc must be approved before PRs for the
 feature will be accepted. It shares some similarities with [Rust RFCs] but
@@ -18,6 +18,7 @@ Jujutsu, you'll need to go through this process.
 1. Wait for the Maintainers and Stakeholders to show up.
 1. Iterate until everyone accepts the change in normal codereview fashion.
 
+[Design Docs]: https://blog.ceejbot.com/posts/design-docs/
 [Rust RFCs]: https://github.com/rust-lang/rfcs
 
 ## Blueprint (Template)
