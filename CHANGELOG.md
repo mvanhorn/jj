@@ -23,6 +23,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   extracted from the `.doc` field of the alias definition if it is a table
   with `.doc` and `.definition` properties.
 
+* `jj git fetch` now generates evolution history based on change IDs. If change
+  IDs are preserved by the remote, local descendant revisions will be rebased
+  onto the rewritten parents.
+
 ### Fixed bugs
 
 * `jj bookmark forget` no longer prints `Forgot N local bookmarks.` when no
