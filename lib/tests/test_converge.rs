@@ -23,6 +23,7 @@ use futures::executor::block_on_stream;
 use itertools::Itertools as _;
 use jj_lib::backend::ChangeId;
 use jj_lib::backend::CommitId;
+use jj_lib::backend::MillisSinceEpoch;
 use jj_lib::backend::Signature;
 use jj_lib::backend::Timestamp;
 use jj_lib::backend::TreeId;
@@ -96,6 +97,84 @@ fn get_predecessors(repo: &ReadonlyRepo, id: &CommitId) -> Vec<CommitId> {
         .first()
         .expect("specified commit should be reachable");
     first.predecessor_ids().to_vec()
+}
+
+fn fixed_signature(name: &str, email: &str, millis: i64, tz_offset: i32) -> Signature {
+    Signature {
+        name: name.to_owned(),
+        email: email.to_owned(),
+        timestamp: Timestamp {
+            timestamp: MillisSinceEpoch(millis),
+            tz_offset,
+        },
+    }
+}
+
+fn assert_same_change_content(commits: &[Commit]) {
+    let first = &commits[0];
+    for commit in &commits[1..] {
+        assert_eq!(commit.change_id(), first.change_id());
+        assert_eq!(commit.description(), first.description());
+        assert_eq!(commit.parent_ids(), first.parent_ids());
+        assert_eq!(commit.tree_ids(), first.tree_ids());
+    }
+}
+
+/// Rewrites `base` once per author, concurrently. Each side keeps the base
+/// change id, description, parents, and tree. Committer signatures differ so
+/// the rewritten commits stay distinct when their authors match.
+fn fork_change_with_authors(
+    test_repo: &TestRepo,
+    base_author: &Signature,
+    side_authors: &[Signature],
+) -> TestResult<(Arc<ReadonlyRepo>, Commit, Vec<Commit>)> {
+    let repo = &test_repo.repo;
+    let root = repo.store().root_commit_id();
+    let tree = repo.store().empty_merged_tree();
+    let change_id = make_change_id(test_repo, 0xA1);
+
+    let mut tx = repo.start_transaction();
+    let base = create_commit(
+        &mut tx,
+        &[root],
+        &tree,
+        base_author,
+        "description",
+        Some(&change_id),
+    );
+    let repo_base = tx.commit("base").block_on()?;
+
+    let mut sides = Vec::new();
+    for (index, author) in side_authors.iter().enumerate() {
+        let mut tx = repo_base.start_transaction();
+        let commit = tx
+            .repo_mut()
+            .rewrite_commit(&base)
+            .set_author(author.clone())
+            .set_committer(fixed_signature(
+                "Committer",
+                "committer@example.com",
+                50_000 + i64::try_from(index).unwrap(),
+                0,
+            ))
+            .write_unwrap();
+        tx.repo_mut().rebase_descendants().block_on()?;
+        tx.commit("side").block_on()?;
+        sides.push(commit);
+    }
+    let repo = repo_base.reload_at_head().block_on()?;
+    assert_same_change_content(&sides);
+    Ok((repo, base, sides))
+}
+
+fn converge_authors(
+    repo: Arc<ReadonlyRepo>,
+    commits: Vec<Commit>,
+    author_override: Option<Signature>,
+) -> TestResult<ConvergedAttribute<Signature>> {
+    let graph = TruncatedEvolutionGraph::new(repo, commits).block_on()?;
+    let result = converge_change(&graph, author_override, None, None, None).block_on()?;
+    Ok(result.author)
 }
 
 fn create_commit(
@@ -1140,5 +1219,326 @@ fn test_automatic_converge_description_parent_and_trees_with_reparent() -> TestR
         ),
     );
     assert_eq!(get_predecessors(&repo, applied.id()), divergent_commit_ids);
+    Ok(())
+}
+
+#[test]
+fn test_converge_author_identical_signatures() -> TestResult {
+    let test_repo = TestRepo::init();
+    let author = fixed_signature("Alice", "alice@example.com", 1_000, 0);
+    let (repo, _base, sides) =
+        fork_change_with_authors(&test_repo, &author, &[author.clone(), author.clone()])?;
+
+    assert_eq!(sides[0].author(), sides[1].author());
+    assert_eq!(sides[0].author().timestamp, author.timestamp);
+
+    let solved = converge_authors(repo, sides, None)?;
+    assert_eq!(solved, ConvergedAttribute::Solved(author));
+    Ok(())
+}
+
+#[test]
+fn test_converge_author_same_identity_different_timestamps() -> TestResult {
+    let test_repo = TestRepo::init();
+    let base = fixed_signature("Alice", "alice@example.com", 1_000, 0);
+    let left = fixed_signature("Alice", "alice@example.com", 2_000, 0);
+    let right = fixed_signature("Alice", "alice@example.com", 3_500, 60);
+    let (repo, _base_commit, sides) =
+        fork_change_with_authors(&test_repo, &base, &[left.clone(), right.clone()])?;
+
+    assert_eq!(sides[0].description(), sides[1].description());
+    assert_eq!(sides[0].parent_ids(), sides[1].parent_ids());
+    assert_eq!(sides[0].tree_ids(), sides[1].tree_ids());
+    assert_eq!(sides[0].change_id(), sides[1].change_id());
+    assert_eq!(sides[0].author().name, sides[1].author().name);
+    assert_eq!(sides[0].author().email, sides[1].author().email);
+    assert_ne!(sides[0].author().timestamp, sides[1].author().timestamp);
+    assert_eq!(sides[0].author(), &left);
+    assert_eq!(sides[1].author(), &right);
+
+    let graph = TruncatedEvolutionGraph::new(repo.clone(), sides.clone()).block_on()?;
+    let result = converge_change(&graph, None, None, None, None).block_on()?;
+    assert_eq!(result.author, ConvergedAttribute::Solved(left.clone()));
+    assert_eq!(
+        result.description,
+        ConvergedAttribute::Solved("description".to_string())
+    );
+    assert_eq!(
+        result.parents,
+        ConvergedAttribute::Solved(sides[0].parent_ids().to_vec())
+    );
+
+    // Reversing the graph's input order keeps the identity and selects the other
+    // original timestamp.
+    let reversed = vec![sides[1].clone(), sides[0].clone()];
+    let solved = converge_authors(repo, reversed, None)?;
+    assert_eq!(solved, ConvergedAttribute::Solved(right));
+    Ok(())
+}
+
+#[test]
+fn test_converge_author_three_matching_identities_timestamp_tie_break() -> TestResult {
+    let test_repo = TestRepo::init();
+    let base = fixed_signature("Alice", "alice@example.com", 1_000, 0);
+    let first = fixed_signature("Alice", "alice@example.com", 1_600_000_000_000, -480);
+    let second = fixed_signature("Alice", "alice@example.com", 1_700_000_000_000, 0);
+    let third = fixed_signature("Alice", "alice@example.com", 1_800_000_000_000, 540);
+    let (repo, _base_commit, sides) = fork_change_with_authors(
+        &test_repo,
+        &base,
+        &[first.clone(), second.clone(), third.clone()],
+    )?;
+
+    assert_eq!(sides[0].author(), &first);
+    assert_eq!(sides[1].author(), &second);
+    assert_eq!(sides[2].author(), &third);
+    assert_ne!(first.timestamp, second.timestamp);
+    assert_ne!(second.timestamp, third.timestamp);
+    assert_ne!(first.timestamp.tz_offset, third.timestamp.tz_offset);
+
+    let solved = converge_authors(repo.clone(), sides.clone(), None)?;
+    assert_eq!(solved, ConvergedAttribute::Solved(first));
+
+    let mut reversed = sides;
+    reversed.reverse();
+    let solved = converge_authors(repo, reversed, None)?;
+    assert_eq!(solved, ConvergedAttribute::Solved(third));
+    Ok(())
+}
+
+#[test]
+fn test_converge_author_one_side_changes_identity_other_side_timestamp() -> TestResult {
+    let test_repo = TestRepo::init();
+    let author_a = fixed_signature("Alice", "alice@example.com", 1_000, 0);
+    let author_a_later = fixed_signature("Alice", "alice@example.com", 2_000, -120);
+    let author_b = fixed_signature("Bob", "bob@example.com", 3_000, 60);
+    let (repo, base, sides) = fork_change_with_authors(
+        &test_repo,
+        &author_a,
+        &[author_a_later.clone(), author_b.clone()],
+    )?;
+
+    assert_eq!(base.author(), &author_a);
+    assert_eq!(sides[0].author(), &author_a_later);
+    assert_eq!(sides[0].author().name, base.author().name);
+    assert_eq!(sides[0].author().email, base.author().email);
+    assert_ne!(sides[0].author().timestamp, base.author().timestamp);
+    assert_eq!(sides[1].author(), &author_b);
+
+    // The timestamp-only commit is first. Identity still resolves to Bob, and the
+    // signature is Bob's original one.
+    let solved = converge_authors(repo.clone(), sides.clone(), None)?;
+    assert_eq!(solved, ConvergedAttribute::Solved(author_b.clone()));
+
+    let reversed = vec![sides[1].clone(), sides[0].clone()];
+    let solved = converge_authors(repo, reversed, None)?;
+    assert_eq!(solved, ConvergedAttribute::Solved(author_b));
+    Ok(())
+}
+
+#[test]
+fn test_converge_author_both_sides_same_new_identity_different_timestamps() -> TestResult {
+    let test_repo = TestRepo::init();
+    let author_a = fixed_signature("Alice", "alice@example.com", 1_000, 0);
+    let author_b1 = fixed_signature("Bob", "bob@example.com", 4_000, 0);
+    let author_b2 = fixed_signature("Bob", "bob@example.com", 5_000, 180);
+    let (repo, base, sides) = fork_change_with_authors(
+        &test_repo,
+        &author_a,
+        &[author_b1.clone(), author_b2.clone()],
+    )?;
+
+    assert_eq!(base.author().name, "Alice");
+    assert_eq!(sides[0].author().name, sides[1].author().name);
+    assert_eq!(sides[0].author().email, sides[1].author().email);
+    assert_ne!(sides[0].author().timestamp, sides[1].author().timestamp);
+    assert_ne!(sides[0].author().timestamp, base.author().timestamp);
+
+    let solved = converge_authors(repo.clone(), sides.clone(), None)?;
+    assert_eq!(solved, ConvergedAttribute::Solved(author_b1));
+
+    let reversed = vec![sides[1].clone(), sides[0].clone()];
+    let solved = converge_authors(repo, reversed, None)?;
+    assert_eq!(solved, ConvergedAttribute::Solved(author_b2));
+    Ok(())
+}
+
+// Evolution (predecessors are below their successors):
+//
+// Carol ts4000          Bob ts3000 tz+120
+//     |                     |
+// Bob ts2000                |
+//      \                   /
+//       Alice ts1000
+//
+// The hidden Bob and the visible Bob are the same identity with different
+// timestamps. Value-flow has to treat them as one value so Carol wins. If
+// timestamps split those Bobs, the dominator falls back to Alice and the
+// author merge stays unsolved.
+#[test]
+fn test_converge_author_historical_identity_ignores_timestamps() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let root = repo.store().root_commit_id();
+    let tree = repo.store().empty_merged_tree();
+    let change_id = make_change_id(&test_repo, 0xB2);
+
+    let author_a = fixed_signature("Alice", "alice@example.com", 1_000, 0);
+    let author_b_hist = fixed_signature("Bob", "bob@example.com", 2_000, 0);
+    let author_b_visible = fixed_signature("Bob", "bob@example.com", 3_000, 120);
+    let author_c = fixed_signature("Carol", "carol@example.com", 4_000, -60);
+
+    let mut tx = repo.start_transaction();
+    let commit_a = create_commit(
+        &mut tx,
+        &[root],
+        &tree,
+        &author_a,
+        "description",
+        Some(&change_id),
+    );
+    let repo_a = tx.commit("base").block_on()?;
+
+    let mut tx = repo_a.start_transaction();
+    let commit_b_hist = tx
+        .repo_mut()
+        .rewrite_commit(&commit_a)
+        .set_author(author_b_hist.clone())
+        .set_committer(fixed_signature(
+            "Committer",
+            "committer@example.com",
+            60_000,
+            0,
+        ))
+        .write_unwrap();
+    tx.repo_mut().rebase_descendants().block_on()?;
+    let repo_b = tx.commit("to bob").block_on()?;
+
+    let mut tx = repo_b.start_transaction();
+    let commit_c = tx
+        .repo_mut()
+        .rewrite_commit(&commit_b_hist)
+        .set_author(author_c.clone())
+        .set_committer(fixed_signature(
+            "Committer",
+            "committer@example.com",
+            60_001,
+            0,
+        ))
+        .write_unwrap();
+    tx.repo_mut().rebase_descendants().block_on()?;
+    tx.commit("to carol").block_on()?;
+
+    let mut tx = repo_a.start_transaction();
+    let commit_b = tx
+        .repo_mut()
+        .rewrite_commit(&commit_a)
+        .set_author(author_b_visible.clone())
+        .set_committer(fixed_signature(
+            "Committer",
+            "committer@example.com",
+            60_002,
+            0,
+        ))
+        .write_unwrap();
+    tx.repo_mut().rebase_descendants().block_on()?;
+    tx.commit("other bob").block_on()?;
+
+    let repo = repo_a.reload_at_head().block_on()?;
+    assert_eq!(
+        get_predecessors(&repo, commit_c.id()),
+        vec![commit_b_hist.id().clone()]
+    );
+    assert_eq!(
+        get_predecessors(&repo, commit_b_hist.id()),
+        vec![commit_a.id().clone()]
+    );
+    assert_eq!(
+        get_predecessors(&repo, commit_b.id()),
+        vec![commit_a.id().clone()]
+    );
+    assert_eq!(commit_b_hist.author().name, commit_b.author().name);
+    assert_eq!(commit_b_hist.author().email, commit_b.author().email);
+    assert_ne!(
+        commit_b_hist.author().timestamp,
+        commit_b.author().timestamp
+    );
+    assert_same_change_content(&[commit_c.clone(), commit_b.clone()]);
+
+    let solved = converge_authors(repo.clone(), vec![commit_b.clone(), commit_c.clone()], None)?;
+    assert_eq!(solved, ConvergedAttribute::Solved(author_c.clone()));
+
+    let solved = converge_authors(repo, vec![commit_c, commit_b], None)?;
+    assert_eq!(solved, ConvergedAttribute::Solved(author_c));
+    Ok(())
+}
+
+#[test]
+fn test_converge_author_conflicting_identities_stay_unsolved() -> TestResult {
+    let author_a = fixed_signature("Alice", "alice@example.com", 1_000, 0);
+    let author_b = fixed_signature("Bob", "bob@example.com", 1_000, 0);
+    let author_c = fixed_signature("Carol", "carol@example.com", 1_000, 0);
+
+    let test_repo = TestRepo::init();
+    let (repo, base, sides) =
+        fork_change_with_authors(&test_repo, &author_a, &[author_b.clone(), author_c.clone()])?;
+    assert_eq!(sides[0].author().timestamp, sides[1].author().timestamp);
+    let solved = converge_authors(repo, sides, None)?;
+    assert_eq!(
+        solved,
+        ConvergedAttribute::Unsolved {
+            base_commit: base.id().clone(),
+            excluded_divergent_commits: HashSet::default(),
+        }
+    );
+
+    // Same email and timestamp, different names.
+    let test_repo = TestRepo::init();
+    let name_b = fixed_signature("Bob", "alice@example.com", 1_000, 0);
+    let name_c = fixed_signature("Carol", "alice@example.com", 1_000, 0);
+    let (repo, base, sides) = fork_change_with_authors(&test_repo, &author_a, &[name_b, name_c])?;
+    assert_eq!(sides[0].author().email, sides[1].author().email);
+    assert_eq!(sides[0].author().timestamp, sides[1].author().timestamp);
+    assert_ne!(sides[0].author().name, sides[1].author().name);
+    let solved = converge_authors(repo, sides, None)?;
+    assert_eq!(
+        solved,
+        ConvergedAttribute::Unsolved {
+            base_commit: base.id().clone(),
+            excluded_divergent_commits: HashSet::default(),
+        }
+    );
+
+    // Same name and timestamp, different emails.
+    let test_repo = TestRepo::init();
+    let email_b = fixed_signature("Alice", "bob@example.com", 1_000, 0);
+    let email_c = fixed_signature("Alice", "carol@example.com", 1_000, 0);
+    let (repo, base, sides) = fork_change_with_authors(&test_repo, &author_a, &[email_b, email_c])?;
+    assert_eq!(sides[0].author().name, sides[1].author().name);
+    assert_eq!(sides[0].author().timestamp, sides[1].author().timestamp);
+    assert_ne!(sides[0].author().email, sides[1].author().email);
+    let solved = converge_authors(repo, sides, None)?;
+    assert_eq!(
+        solved,
+        ConvergedAttribute::Unsolved {
+            base_commit: base.id().clone(),
+            excluded_divergent_commits: HashSet::default(),
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn test_converge_author_explicit_override_is_unchanged() -> TestResult {
+    let test_repo = TestRepo::init();
+    let author_a = fixed_signature("Alice", "alice@example.com", 1_000, 0);
+    let author_b = fixed_signature("Bob", "bob@example.com", 2_000, 0);
+    let author_c = fixed_signature("Carol", "carol@example.com", 3_000, 60);
+    let (repo, _base, sides) =
+        fork_change_with_authors(&test_repo, &author_a, &[author_b, author_c])?;
+    let override_author = fixed_signature("Override", "override@example.com", 9_001, -210);
+
+    let solved = converge_authors(repo, sides, Some(override_author.clone()))?;
+    assert_eq!(solved, ConvergedAttribute::Solved(override_author));
     Ok(())
 }

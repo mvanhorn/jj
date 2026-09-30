@@ -1617,6 +1617,179 @@ fn test_converge_two_divergent_commits_with_unrelated_commit_in_between() -> Tes
     Ok(())
 }
 
+// Divergent revisions with the same author name and email, and different
+// author timestamps, converge without an author prompt. The solution keeps the
+// author timestamp of the first divergent commit in revset order.
+#[test]
+fn test_converge_same_author_identity_different_timestamps() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    create_commit_with_files(&work_dir, "a", &[], &[("file1", "1")]);
+    create_commit_with_files(&work_dir, "b2", &["a"], &[("file2", "2")]);
+    work_dir
+        .run_jj([
+            "metaedit",
+            "-r",
+            "b2",
+            "--author-timestamp",
+            "1995-12-19T16:39:57-08:00",
+        ])
+        .success();
+    work_dir
+        .run_jj(["bookmark", "create", "b1", "-r", "at_operation(@-, b2)"])
+        .success();
+
+    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
+    @  b2  zsuskuln/0  f032b26d - description: b2
+    │ ○  b1  zsuskuln/1  59a77004 - description: b2
+    ├─╯
+    ○  a  rlvkpnrz  e9a731d9 - description: a
+    ◆    zzzzzzzz  00000000
+    [EOF]
+    ");
+    // b2 is first in revset order and carries the edited author timestamp.
+    insta::assert_snapshot!(get_author_log(&work_dir, "b1|b2"), @"
+    b2 zsuskuln/0 f032b26d Test User test.user@example.com 1995-12-19 16:39:57.000 -08:00 b2
+    b1 zsuskuln/1 59a77004 Test User test.user@example.com 2001-02-03 04:05:10.000 +07:00 b2
+    [EOF]
+    ");
+
+    let output = work_dir.run_jj(["converge"]).success();
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Found 1 divergent change(s) in the specified revset:
+    - Change: zsuskulnrvyr with 2 commits:
+        zsuskuln/0 f032b26d b2 | (divergent) b2
+        zsuskuln/1 59a77004 b1 | (divergent) b2
+
+    Attempting to converge change zsuskulnrvyr...
+
+    Successfully converged change: created commit e68d8ab2ada7.
+    Working copy  (@) now at: zsuskuln e68d8ab2 b1 b2 | b2
+    Parent commit (@-)      : rlvkpnrz e9a731d9 a | a
+    [EOF]
+    ");
+
+    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
+    @  b1 b2  zsuskuln  e68d8ab2 - description: b2
+    ○  a  rlvkpnrz  e9a731d9 - description: a
+    ◆    zzzzzzzz  00000000
+    [EOF]
+    ");
+    insta::assert_snapshot!(get_author_log(&work_dir, "b1|b2"), @"
+    b1 b2 zsuskuln e68d8ab2 Test User test.user@example.com 1995-12-19 16:39:57.000 -08:00 b2
+    [EOF]
+    ");
+    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
+    @    zsuskuln e68d8ab2 b2
+    ├─╮
+    ○ │  zsuskuln/1 f032b26d (hidden) b2
+    ├─╯
+    ○  zsuskuln/2 59a77004 (hidden) b2
+    ○  zsuskuln/3 b2852eb2 (hidden) (empty) b2
+    [EOF]
+    ");
+}
+
+// Authors with different names and emails stay unresolved. Non-interactive
+// mode reports that, and aborting the author prompt leaves the repository
+// unchanged.
+#[test]
+fn test_converge_conflicting_authors() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    create_commit_with_files(&work_dir, "a", &[], &[("file1", "1")]);
+    create_commit_with_files(&work_dir, "b2", &["a"], &[("file2", "2")]);
+    work_dir
+        .run_jj([
+            "metaedit",
+            "-r",
+            "b2",
+            "--author",
+            "Alice <alice@example.com>",
+        ])
+        .success();
+    work_dir
+        .run_jj(["bookmark", "create", "b1", "-r", "at_operation(@-, b2)"])
+        .success();
+    work_dir
+        .run_jj(["metaedit", "-r", "b1", "--author", "Bob <bob@example.com>"])
+        .success();
+
+    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
+    @  b2  zsuskuln/1  858b1852 - description: b2
+    │ ○  b1  zsuskuln/0  302b063f - description: b2
+    ├─╯
+    ○  a  rlvkpnrz  e9a731d9 - description: a
+    ◆    zzzzzzzz  00000000
+    [EOF]
+    ");
+    insta::assert_snapshot!(get_author_log(&work_dir, "b1|b2"), @"
+    b1 zsuskuln/0 302b063f Bob bob@example.com 2001-02-03 04:05:10.000 +07:00 b2
+    b2 zsuskuln/1 858b1852 Alice alice@example.com 2001-02-03 04:05:10.000 +07:00 b2
+    [EOF]
+    ");
+
+    let output =
+        work_dir.run_jj_with(|cmd| force_interactive(cmd).args(["converge", "--no-interactive"]));
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Found 1 divergent change(s) in the specified revset:
+    - Change: zsuskulnrvyr with 2 commits:
+        zsuskuln/0 302b063f b1 | (divergent) b2
+        zsuskuln/1 858b1852 b2 | (divergent) b2
+
+    Attempting to converge change zsuskulnrvyr...
+
+    Could not determine which author to use.
+    Error: Could not converge change
+    [EOF]
+    [exit status: 1]
+    ");
+    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
+    @  b2  zsuskuln/1  858b1852 - description: b2
+    │ ○  b1  zsuskuln/0  302b063f - description: b2
+    ├─╯
+    ○  a  rlvkpnrz  e9a731d9 - description: a
+    ◆    zzzzzzzz  00000000
+    [EOF]
+    ");
+
+    let output =
+        work_dir.run_jj_with(|cmd| force_interactive(cmd).args(["converge"]).write_stdin("q\n"));
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Found 1 divergent change(s) in the specified revset:
+    - Change: zsuskulnrvyr with 2 commits:
+        zsuskuln/0 302b063f b1 | (divergent) b2
+        zsuskuln/1 858b1852 b2 | (divergent) b2
+
+    Attempting to converge change zsuskulnrvyr...
+
+    Could not determine automatically which author to use
+    1: 302b063fd0d3 (Bob, bob@example.com)
+    2: 858b185289db (Alice, alice@example.com)
+    q: abort
+    Enter the index of the author you want to use: 
+
+    Error: Aborting... nothing changed.
+    [EOF]
+    [exit status: 1]
+    ");
+    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
+    @  b2  zsuskuln/1  858b1852 - description: b2
+    │ ○  b1  zsuskuln/0  302b063f - description: b2
+    ├─╯
+    ○  a  rlvkpnrz  e9a731d9 - description: a
+    ◆    zzzzzzzz  00000000
+    [EOF]
+    ");
+}
+
 #[must_use]
 fn get_long_log_output(work_dir: &TestWorkDir) -> CommandOutput {
     let template = "bookmarks ++ '  ' ++ format_short_change_id_with_change_offset(self) ++ '  ' \
@@ -1628,6 +1801,20 @@ fn get_long_log_output(work_dir: &TestWorkDir) -> CommandOutput {
 #[must_use]
 fn get_op_log_output(work_dir: &TestWorkDir) -> CommandOutput {
     work_dir.run_jj(["op", "log", "-T", "description ++ '\n' ++ attributes"])
+}
+
+#[must_use]
+fn get_author_log(work_dir: &TestWorkDir, revset: &str) -> CommandOutput {
+    let template = r#"separate(" ",
+        bookmarks,
+        format_short_change_id_with_change_offset(self),
+        commit_id.shortest(8),
+        author.name(),
+        author.email(),
+        author.timestamp(),
+        description.first_line(),
+    ) ++ "\n""#;
+    work_dir.run_jj(["log", "-r", revset, "-T", template, "--no-graph"])
 }
 
 #[must_use]

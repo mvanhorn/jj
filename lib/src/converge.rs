@@ -375,12 +375,35 @@ impl TruncatedEvolutionGraph {
 async fn converge_author(
     graph: &TruncatedEvolutionGraph,
 ) -> Result<ConvergedAttribute<Signature>, ConvergeError> {
-    let value_fn = async |c: &Commit| Ok(c.author().clone());
+    // Author identity is the name and email. Value-flow analysis and trivial
+    // merging compare that pair for every commit they visit, including
+    // historical ones, so author timestamps do not create conflicts.
+    let value_fn = async |commit: &Commit| {
+        let author = commit.author();
+        Ok((author.name.clone(), author.email.clone()))
+    };
     let excluded_divergent_commits = HashSet::default();
     let (value_merge, base_commit) =
         create_value_merge(graph, &excluded_divergent_commits, value_fn).await?;
-    if let Some(value) = value_merge.resolve_trivial(SameChange::Accept) {
-        Ok(ConvergedAttribute::Solved(value.clone()))
+    if let Some((name, email)) = value_merge.resolve_trivial(SameChange::Accept) {
+        // Several divergent commits can share the resolved identity and differ
+        // only by timestamp or timezone. Keep the full signature of the first
+        // match in graph input order (the order passed to
+        // `TruncatedEvolutionGraph`), copied from that commit.
+        let Some(signature) = graph
+            .divergent_commits()
+            .iter()
+            .find(|commit| {
+                let author = commit.author();
+                author.name == *name && author.email == *email
+            })
+            .map(|commit| commit.author().clone())
+        else {
+            return Err(ConvergeError::Other(
+                "resolved author identity is not present on a divergent commit".into(),
+            ));
+        };
+        Ok(ConvergedAttribute::Solved(signature))
     } else {
         Ok(ConvergedAttribute::Unsolved {
             base_commit,
